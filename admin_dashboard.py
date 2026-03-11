@@ -10,7 +10,7 @@ from azure.cosmos import CosmosClient
 import pandas as pd
 from datetime import datetime
 import json
-import io
+import os
 
 # Configuration de la page Streamlit
 st.set_page_config(
@@ -77,17 +77,23 @@ st.markdown("""
 @st.cache_resource
 def get_cosmos_client():
     """Initialise et retourne le client Cosmos DB"""
-    # Lire depuis les secrets Streamlit (requis pour le déploiement)
-    # En local: créer .streamlit/secrets.toml
-    # Sur Streamlit Cloud: configurer dans les paramètres de l'app
-    connection_string = st.secrets["cosmos"]["connection_string"]
-    
+    connection_string = os.getenv("COSMOS_CONNECTION_STRING")
+
+    if not connection_string:
+        try:
+            connection_string = st.secrets["cosmos"]["connection_string"]
+        except (KeyError, FileNotFoundError):
+            raise RuntimeError(
+                "COSMOS_CONNECTION_STRING manquante. Configurez la variable d'environnement ou le secret Streamlit [cosmos].connection_string."
+            )
+
     client = CosmosClient.from_connection_string(connection_string)
     database = client.get_database_client("AuthDB")
     return {
         'users': database.get_container_client("users"),
         'conversations': database.get_container_client("conversations")
     }
+
 
 @st.cache_data(ttl=60)
 def load_users():
@@ -123,6 +129,46 @@ def get_user_conversations(user_id):
         enable_cross_partition_query=True
     ))
     return conversations
+
+def manually_verify_user(user):
+    """Marque un utilisateur comme verifie manuellement dans Cosmos DB."""
+    containers = get_cosmos_client()
+    users_container = containers['users']
+
+    updated_user = dict(user)
+    updated_user['is_verified'] = True
+    updated_user['verification_token'] = None
+
+    users_container.replace_item(
+        item=updated_user,
+        body=updated_user
+    )
+
+def upgrade_user_to_premium(user):
+    """Passe un utilisateur au plan premium dans Cosmos DB."""
+    containers = get_cosmos_client()
+    users_container = containers['users']
+
+    updated_user = dict(user)
+    updated_user['plan'] = 'premium'
+
+    users_container.replace_item(
+        item=updated_user,
+        body=updated_user
+    )
+
+def downgrade_user_to_freemium(user):
+    """Repasse un utilisateur au plan freemium dans Cosmos DB."""
+    containers = get_cosmos_client()
+    users_container = containers['users']
+
+    updated_user = dict(user)
+    updated_user['plan'] = 'freemium'
+
+    users_container.replace_item(
+        item=updated_user,
+        body=updated_user
+    )
 
 def format_date(iso_date):
     """Formate une date ISO en format lisible"""
@@ -163,7 +209,16 @@ st.markdown('<h1 class="main-header">🌿 Gaia Admin Dashboard</h1>', unsafe_all
 
 # Barre latérale de navigation
 st.sidebar.title("Navigation")
-page = st.sidebar.radio("Aller à", ["📊 Vue d'ensemble", "👥 Utilisateurs", "💬 Conversations", "🔍 Recherche"])
+page = st.sidebar.radio(
+    "Aller à",
+    [
+        "📊 Vue d'ensemble",
+        "📨 Emails non vérifiés",
+        "👥 Utilisateurs",
+        "💬 Conversations",
+        "🔍 Recherche"
+    ]
+)
 
 # Bouton de rafraîchissement
 if st.sidebar.button("🔄 Rafraîchir les données"):
@@ -245,11 +300,62 @@ if page == "📊 Vue d'ensemble":
     except Exception as e:
         st.error(f"❌ Erreur lors du chargement des données: {str(e)}")
 
+# ===== PAGE: EMAILS NON VERIFIES =====
+elif page == "📨 Emails non vérifiés":
+    st.header("📨 Comptes non verifies")
+
+    try:
+        success_email = st.session_state.pop("manual_verify_success", None)
+        if success_email:
+            st.success(f"Compte verifie manuellement pour {success_email}.")
+
+        users = load_users()
+        unverified_users = [u for u in users if not u.get('is_verified', False)]
+
+        st.info(f"📊 {len(unverified_users)} compte(s) non verifie(s)")
+
+        if not unverified_users:
+            st.success("Tous les comptes sont verifies.")
+        else:
+            for user in unverified_users:
+                with st.expander(f"📧 {user.get('email', 'N/A')} - Plan: {user.get('plan', 'N/A').upper()}"):
+                    col1, col2 = st.columns(2)
+
+                    with col1:
+                        st.write("**Informations generales:**")
+                        st.write(f"- **ID:** `{user.get('id', 'N/A')}`")
+                        st.write(f"- **Email:** {user.get('email', 'N/A')}")
+                        st.write(f"- **Prenom:** {user.get('firstName', 'N/A')}")
+                        st.write(f"- **Nom:** {user.get('lastName', 'N/A')}")
+                        st.write(f"- **Plan:** {user.get('plan', 'N/A')}")
+                        st.write("- **Verifie:** ❌ Non")
+
+                    with col2:
+                        st.write("**Informations de compte:**")
+                        st.write(f"- **Cree le:** {format_date(user.get('createdAt', 'N/A'))}")
+                        st.write(f"- **Expire le:** {format_date(user.get('accountExpiresAt', 'N/A'))}")
+                        st.write(f"- **Requetes quotidiennes:** {user.get('daily_requests', 0)}")
+                        st.write(f"- **Derniere requete:** {user.get('last_request_date', 'N/A')}")
+                        st.write(f"- **Stripe ID:** {user.get('stripe_customer_id', 'N/A') or 'Aucun'}")
+
+                    if st.button("Valider manuellement ce compte", key=f"manual_verify_{user.get('id', 'unknown')}"):
+                        manually_verify_user(user)
+                        st.cache_data.clear()
+                        st.session_state["manual_verify_success"] = user.get('email', 'N/A')
+                        st.rerun()
+
+    except Exception as e:
+        st.error(f"❌ Erreur: {str(e)}")
+
 # ===== PAGE: UTILISATEURS =====
 elif page == "👥 Utilisateurs":
     st.header("👥 Gestion des Utilisateurs")
     
     try:
+        plan_change_success = st.session_state.pop("plan_change_success", None)
+        if plan_change_success:
+            st.success(f"Plan mis a jour pour {plan_change_success['email']}: {plan_change_success['plan']}.")
+
         users = load_users()
         
         # Filtres
@@ -269,58 +375,6 @@ elif page == "👥 Utilisateurs":
             filtered_users = [u for u in filtered_users if not u.get('is_verified', False)]
         
         st.info(f"📊 {len(filtered_users)} utilisateur(s) affiché(s)")
-        
-        # Export Excel
-        st.subheader("📥 Exporter les données")
-        col_export1, col_export2 = st.columns(2)
-        
-        with col_export1:
-            # Préparer les données pour l'export
-            export_data = []
-            for user in filtered_users:
-                export_data.append({
-                    'Email': user.get('email', 'N/A'),
-                    'Plan': user.get('plan', 'N/A'),
-                    'Prénom': user.get('firstName', 'N/A'),
-                    'Nom': user.get('lastName', 'N/A'),
-                    'Vérifié': 'Oui' if user.get('is_verified', False) else 'Non',
-                    'Créé le': user.get('createdAt', 'N/A'),
-                    'Requêtes quotidiennes': user.get('daily_requests', 0)
-                })
-            
-            df_export = pd.DataFrame(export_data)
-            
-            # Créer le fichier Excel en mémoire
-            buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                df_export.to_excel(writer, index=False, sheet_name='Utilisateurs')
-            buffer.seek(0)
-            
-            st.download_button(
-                label="📊 Télécharger Excel (Complet)",
-                data=buffer,
-                file_name="gaia_utilisateurs.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-        
-        with col_export2:
-            # Export simplifié (email + plan seulement)
-            simple_data = [{'Email': user.get('email', 'N/A'), 'Plan': user.get('plan', 'N/A')} for user in filtered_users]
-            df_simple = pd.DataFrame(simple_data)
-            
-            buffer_simple = io.BytesIO()
-            with pd.ExcelWriter(buffer_simple, engine='openpyxl') as writer:
-                df_simple.to_excel(writer, index=False, sheet_name='Emails_Plans')
-            buffer_simple.seek(0)
-            
-            st.download_button(
-                label="📧 Télécharger Excel (Email + Plan)",
-                data=buffer_simple,
-                file_name="gaia_emails_plans.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-        
-        st.markdown("---")
         
         # Tableau des utilisateurs
         for user in filtered_users:
@@ -357,6 +411,33 @@ elif page == "👥 Utilisateurs":
                         st.write(f"... et {len(user_conversations) - 5} autres conversations")
                 else:
                     st.write("_Aucune conversation_")
+
+                action_col1, action_col2 = st.columns(2)
+                with action_col1:
+                    if user.get('plan') == 'premium':
+                        st.success("Cet utilisateur est deja en premium.")
+                    else:
+                        if st.button("Upgrade en premium", key=f"upgrade_premium_{user.get('id', 'unknown')}"):
+                            upgrade_user_to_premium(user)
+                            st.cache_data.clear()
+                            st.session_state["plan_change_success"] = {
+                                "email": user.get('email', 'N/A'),
+                                "plan": "premium"
+                            }
+                            st.rerun()
+
+                with action_col2:
+                    if user.get('plan') == 'freemium':
+                        st.info("Cet utilisateur est deja en freemium.")
+                    else:
+                        if st.button("Downgrade en freemium", key=f"downgrade_freemium_{user.get('id', 'unknown')}"):
+                            downgrade_user_to_freemium(user)
+                            st.cache_data.clear()
+                            st.session_state["plan_change_success"] = {
+                                "email": user.get('email', 'N/A'),
+                                "plan": "freemium"
+                            }
+                            st.rerun()
     
     except Exception as e:
         st.error(f"❌ Erreur: {str(e)}")
@@ -418,6 +499,10 @@ elif page == "🔍 Recherche":
     
     with col1:
         st.subheader("Rechercher un utilisateur")
+        plan_change_success = st.session_state.pop("plan_change_success", None)
+        if plan_change_success:
+            st.success(f"Plan mis a jour pour {plan_change_success['email']}: {plan_change_success['plan']}.")
+
         search_email = st.text_input("Par email", "")
         search_user_id = st.text_input("Par ID utilisateur", "")
         
@@ -430,15 +515,52 @@ elif page == "🔍 Recherche":
                     results = [u for u in users if search_email.lower() in u.get('email', '').lower()]
                 elif search_user_id:
                     results = [u for u in users if u.get('id') == search_user_id]
-                
-                if results:
-                    st.success(f"✅ {len(results)} résultat(s) trouvé(s)")
-                    for user in results:
-                        st.json(user)
-                else:
-                    st.warning("⚠️ Aucun résultat")
+                st.session_state["search_user_results"] = results
             except Exception as e:
                 st.error(f"❌ Erreur: {str(e)}")
+
+        search_results = st.session_state.get("search_user_results", [])
+        if search_results:
+            st.success(f"✅ {len(search_results)} résultat(s) trouvé(s)")
+            for user in search_results:
+                with st.expander(f"📧 {user.get('email', 'N/A')} - Plan: {user.get('plan', 'N/A').upper()}"):
+                    st.write(f"**ID:** `{user.get('id', 'N/A')}`")
+                    st.write(f"**Email:** {user.get('email', 'N/A')}")
+                    st.write(f"**Plan:** {user.get('plan', 'N/A')}")
+                    st.write(f"**Vérifié:** {'✅ Oui' if user.get('is_verified', False) else '❌ Non'}")
+                    st.write(f"**Créé le:** {format_date(user.get('createdAt', 'N/A'))}")
+
+                    action_col1, action_col2 = st.columns(2)
+                    with action_col1:
+                        if user.get('plan') == 'premium':
+                            st.success("Cet utilisateur est deja en premium.")
+                        else:
+                            if st.button("Upgrade en premium", key=f"search_upgrade_premium_{user.get('id', 'unknown')}"):
+                                upgrade_user_to_premium(user)
+                                st.cache_data.clear()
+                                st.session_state["plan_change_success"] = {
+                                    "email": user.get('email', 'N/A'),
+                                    "plan": "premium"
+                                }
+                                st.session_state.pop("search_user_results", None)
+                                st.rerun()
+
+                    with action_col2:
+                        if user.get('plan') == 'freemium':
+                            st.info("Cet utilisateur est deja en freemium.")
+                        else:
+                            if st.button("Downgrade en freemium", key=f"search_downgrade_freemium_{user.get('id', 'unknown')}"):
+                                downgrade_user_to_freemium(user)
+                                st.cache_data.clear()
+                                st.session_state["plan_change_success"] = {
+                                    "email": user.get('email', 'N/A'),
+                                    "plan": "freemium"
+                                }
+                                st.session_state.pop("search_user_results", None)
+                                st.rerun()
+        elif search_email or search_user_id:
+            if "search_user_results" in st.session_state:
+                st.warning("⚠️ Aucun résultat")
     
     with col2:
         st.subheader("Rechercher une conversation")
