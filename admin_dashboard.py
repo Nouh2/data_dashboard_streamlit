@@ -9,6 +9,7 @@ import streamlit as st
 from azure.cosmos import CosmosClient
 import pandas as pd
 from datetime import datetime
+from io import BytesIO
 import json
 import os
 
@@ -177,6 +178,37 @@ def format_date(iso_date):
         return dt.strftime("%d/%m/%Y %H:%M")
     except:
         return iso_date
+
+def format_user_status(user):
+    """Retourne un statut lisible pour l'export utilisateur."""
+    if user.get('isSuspended', False):
+        return "Suspendu"
+    if user.get('is_verified', False):
+        return "Verifie"
+    return "Non verifie"
+
+def build_users_excel_export(users):
+    """Construit un fichier Excel en memoire pour l'export des utilisateurs."""
+    export_rows = []
+    for user in users:
+        export_rows.append({
+            "Nom": user.get('lastName', ''),
+            "Prenom": user.get('firstName', ''),
+            "Adresse mail": user.get('email', ''),
+            "Status": format_user_status(user),
+            "Type d'abonnement": user.get('plan', 'N/A')
+        })
+
+    df = pd.DataFrame(
+        export_rows,
+        columns=["Nom", "Prenom", "Adresse mail", "Status", "Type d'abonnement"]
+    )
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Utilisateurs")
+    output.seek(0)
+    return output.getvalue()
 
 def display_message(message, index, conversation_id=""):
     """Affiche un message de conversation"""
@@ -376,6 +408,16 @@ elif page == "👥 Utilisateurs":
         
         st.info(f"📊 {len(filtered_users)} utilisateur(s) affiché(s)")
         
+        export_file = build_users_excel_export(filtered_users)
+        st.download_button(
+            "Exporter en Excel",
+            data=export_file,
+            file_name=f"utilisateurs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            disabled=len(filtered_users) == 0,
+            key="export_users_excel"
+        )
+
         # Tableau des utilisateurs
         for user in filtered_users:
             with st.expander(f"📧 {user.get('email', 'N/A')} - Plan: {user.get('plan', 'N/A').upper()}"):
