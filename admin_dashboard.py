@@ -187,21 +187,77 @@ def format_user_status(user):
         return "Verifie"
     return "Non verifie"
 
+def get_user_language(user):
+    """Retourne la langue de l'utilisateur a partir des cles les plus probables."""
+    for key in (
+        "language",
+        "lang",
+        "locale",
+        "preferredLanguage",
+        "preferred_language",
+        "userLanguage",
+        "user_language",
+    ):
+        value = user.get(key)
+        if value:
+            return value
+    return "N/A"
+
+def build_conversation_stats_by_user(conversations):
+    """Agrege le nombre de conversations et de messages par utilisateur."""
+    stats_by_user = {}
+
+    for conversation in conversations:
+        user_id = conversation.get("userId")
+        if not user_id:
+            continue
+
+        user_stats = stats_by_user.setdefault(
+            user_id,
+            {"conversation_count": 0, "message_count": 0}
+        )
+        user_stats["conversation_count"] += 1
+
+        messages = conversation.get("messages", [])
+        if isinstance(messages, list):
+            user_stats["message_count"] += len(messages)
+
+    return stats_by_user
+
 def build_users_excel_export(users):
     """Construit un fichier Excel en memoire pour l'export des utilisateurs."""
+    conversations = load_conversations()
+    stats_by_user = build_conversation_stats_by_user(conversations)
     export_rows = []
+
     for user in users:
+        user_stats = stats_by_user.get(
+            user.get("id"),
+            {"conversation_count": 0, "message_count": 0}
+        )
         export_rows.append({
             "Nom": user.get('lastName', ''),
             "Prenom": user.get('firstName', ''),
             "Adresse mail": user.get('email', ''),
             "Status": format_user_status(user),
-            "Type d'abonnement": user.get('plan', 'N/A')
+            "Type d'abonnement": user.get('plan', 'N/A'),
+            "Langue": get_user_language(user),
+            "Nombre de messages": user_stats["message_count"],
+            "Nombre de conversations": user_stats["conversation_count"],
         })
 
     df = pd.DataFrame(
         export_rows,
-        columns=["Nom", "Prenom", "Adresse mail", "Status", "Type d'abonnement"]
+        columns=[
+            "Nom",
+            "Prenom",
+            "Adresse mail",
+            "Status",
+            "Type d'abonnement",
+            "Langue",
+            "Nombre de messages",
+            "Nombre de conversations",
+        ]
     )
 
     output = BytesIO()
